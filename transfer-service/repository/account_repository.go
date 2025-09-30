@@ -1,9 +1,12 @@
 package repository
 
-import "transfer-service/models"
+import (
+	"context"
+	"transfer-service/models"
+)
 
-// Interface Segregation Principle - focused interface
 type AccountRepository interface {
-	GetAccountById(accountId string) (*models.Account, error)
-	UpdateAccount(account *models.Account) error
+	GetAccountById(ctx context.Context, accountId string) (*models.Account, error)
+	UpdateAccount(ctx context.Context, account *models.Account) error
+	GetMultipleAccounts(ctx context.Context, accountIds []string) ([]*models.Account, error)
 }

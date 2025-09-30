@@ -2,103 +2,43 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"transfer-service/models"
 	"transfer-service/repository"
 	"transfer-service/service"
 )
 
 func main() {
-	fmt.Println("Money Transfer Service v2 - SOLID Implementation")
-	fmt.Println("===============================================")
+	fmt.Println("Money Transfer Service v4 - Concurrency + Tests")
+	fmt.Println("================================================")
 
-	// Init / Booting phase
-	//-------------------------------
-	//
-	// Dependency Injection - create repository once
-	sqlAccountRepo := repository.GetSqlAccountRepository() // dependency
+	repo := repository.GetSqlAccountRepository()
+	svc := service.NewUPITransferService(repo)
 
-	// Inject repository into services
-	upiService := service.NewUPITransferService(sqlAccountRepo)
-	rtgsService := service.NewRTGSTransferService(sqlAccountRepo)
-
-	fmt.Println("\n--- UPI Transfer Tests ---")
-	demonstrateUPITransfers(upiService)
-
-	fmt.Println("\n--- RTGS Transfer Tests ---")
-	demonstrateRTGSTransfers(rtgsService)
-
-	fmt.Println("\n--- Balance Checks ---")
-	demonstrateBalanceChecks(upiService)
-
-	fmt.Println("\n--- Error Handling Tests ---")
-	demonstrateErrorHandling(upiService)
-}
-
-func demonstrateUPITransfers(service service.TransferService) {
-	err := service.Transfer("1", "2", 300.00)
+	// Single transfer demo
+	err := svc.Transfer(context.Background(), "1", "2", 150)
 	if err != nil {
-		fmt.Printf("UPI Transfer 1 failed: %v\n", err)
+		fmt.Printf("Transfer failed: %v\n", err)
 	} else {
-		fmt.Println("UPI Transfer 1: Success")
+		fmt.Println("Transfer success")
 	}
 
-	err = service.Transfer("2", "3", 150.00)
-	if err != nil {
-		fmt.Printf("UPI Transfer 2 failed: %v\n", err)
-	} else {
-		fmt.Println("UPI Transfer 2: Success")
+	// Bulk transfer demo
+	transfers := []models.TransferRequest{
+		{FromAccountId: "1", ToAccountId: "2", Amount: 10, RequestId: "REQ-1"},
+		{FromAccountId: "2", ToAccountId: "3", Amount: 20, RequestId: "REQ-2"},
+		{FromAccountId: "3", ToAccountId: "1", Amount: 15, RequestId: "REQ-3"},
 	}
-}
-
-func demonstrateRTGSTransfers(service service.TransferService) {
-	// Should fail due to minimum amount requirement
-	err := service.Transfer("1", "2", 100000.00)
-	if err != nil {
-		fmt.Printf("RTGS Transfer 1 failed: %v\n", err)
-	} else {
-		fmt.Println("RTGS Transfer 1: Success")
+	results := svc.BulkTransfer(context.Background(), transfers)
+	for _, r := range results {
+		if r.Success {
+			fmt.Printf("%s: SUCCESS\n", r.RequestId)
+		} else {
+			fmt.Printf("%s: FAILED (%v)\n", r.RequestId, r.Error)
+		}
 	}
 
-	// Should succeed
-	err = service.Transfer("1", "2", 250000.00)
-	if err != nil {
-		fmt.Printf("RTGS Transfer 2 failed: %v\n", err)
-	} else {
-		fmt.Println("RTGS Transfer 2: Success")
-	}
-}
-
-func demonstrateBalanceChecks(service service.TransferService) {
-	balance, err := service.GetAccountBalance("1")
-	if err != nil {
-		fmt.Printf("Balance check failed: %v\n", err)
-	} else {
-		fmt.Printf("Account 1 balance: %.2f\n", balance)
-	}
-}
-
-func demonstrateErrorHandling(service service.TransferService) {
-	// Invalid amount
-	err := service.Transfer("1", "2", -100.00)
-	if err != nil {
-		fmt.Printf("Negative amount test: %v\n", err)
-	}
-
-	// Same account transfer
-	err = service.Transfer("1", "1", 100.00)
-	if err != nil {
-		fmt.Printf("Same account test: %v\n", err)
-	}
-
-	// Non-existent account
-	err = service.Transfer("1", "999", 100.00)
-	if err != nil {
-		fmt.Printf("Non-existent account test: %v\n", err)
-	}
-
-	// Insufficient balance
-	err = service.Transfer("1", "2", 9999999.00)
-	if err != nil {
-		fmt.Printf("Insufficient balance test: %v\n", err)
-	}
+	total, success := svc.GetStats()
+	fmt.Printf("\nFinal Stats: total=%d, success=%d\n", total, success)
 }

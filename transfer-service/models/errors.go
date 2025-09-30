@@ -1,6 +1,9 @@
 package models
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Custom error types for better error handling
 type TransferError struct {
@@ -40,4 +43,26 @@ func NewInvalidAmountError(amount float64) *TransferError {
 		Message: fmt.Sprintf("Invalid transfer amount: %.2f", amount),
 		Details: map[string]interface{}{"amount": amount},
 	}
+}
+
+func NewTimeoutError() *TransferError {
+	return &TransferError{
+		Code:    "TIMEOUT",
+		Message: "Operation timed out",
+	}
+}
+func NewCancelledError() *TransferError {
+	return &TransferError{
+		Code:    "CANCELLED",
+		Message: "Operation was cancelled",
+	}
+}
+func WrapContextError(err error) *TransferError {
+	if err == context.Canceled {
+		return NewCancelledError()
+	}
+	if err == context.DeadlineExceeded {
+		return NewTimeoutError()
+	}
+	return &TransferError{Code: "CONTEXT_ERROR", Message: err.Error()}
 }

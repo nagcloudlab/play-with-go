@@ -2,105 +2,148 @@
 package service
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"time"
 	"transfer-service/models"
 	"transfer-service/repository"
 )
 
-// UPI implementation of TransferService interface
 type UPITransferService struct {
-	accountRepo repository.AccountRepository // Dependency Inversion - depends on interface
+	accountRepo   repository.AccountRepository
+	transferCount int64
+	successCount  int64
+	mutex         sync.RWMutex
 }
 
-// Constructor with Dependency Injection
-func NewUPITransferService(accountRepo repository.AccountRepository) *UPITransferService {
-	fmt.Println("[SERVICE] Creating UPITransferService with injected dependencies")
-	return &UPITransferService{
-		accountRepo: accountRepo,
-	}
+func NewUPITransferService(repo repository.AccountRepository) *UPITransferService {
+	fmt.Println("[SERVICE] Creating UPITransferService with concurrency support")
+	return &UPITransferService{accountRepo: repo}
 }
 
-// Single Responsibility - only handles transfer logic
-func (s *UPITransferService) Transfer(fromAccountId, toAccountId string, amount float64) error {
-	fmt.Printf("[SERVICE] Starting UPI transfer: %.2f from %s to %s\n", amount, fromAccountId, toAccountId)
+func (s *UPITransferService) Transfer(ctx context.Context, fromId, toId string, amount float64) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 
-	// Input validation
-	if err := s.validateTransferInput(fromAccountId, toAccountId, amount); err != nil {
+	s.incrementTransferCount()
+	if err := s.validateInput(fromId, toId, amount); err != nil {
 		return err
 	}
 
-	// Load accounts
-	fromAccount, err := s.accountRepo.GetAccountById(fromAccountId)
+	accounts, err := s.accountRepo.GetMultipleAccounts(ctx, []string{fromId, toId})
 	if err != nil {
 		return err
 	}
-
-	toAccount, err := s.accountRepo.GetAccountById(toAccountId)
-	if err != nil {
-		return err
+	from, to := accounts[0], accounts[1]
+	success := s.atomicTransfer(from, to, amount)
+	if !success {
+		return models.NewInsufficientBalanceError(fromId, from.GetBalance(), amount)
 	}
 
-	// Business validation
-	if fromAccount.Balance < amount {
-		return models.NewInsufficientBalanceError(fromAccountId, fromAccount.Balance, amount)
-	}
+	errChan := make(chan error, 2)
+	go func() { errChan <- s.accountRepo.UpdateAccount(ctx, from) }()
+	go func() { errChan <- s.accountRepo.UpdateAccount(ctx, to) }()
 
-	// Perform transfer
-	fmt.Printf("[SERVICE] Debiting %.2f from account %s via UPI\n", amount, fromAccountId)
-	fromAccount.Balance = fromAccount.Balance - amount
-
-	fmt.Printf("[SERVICE] Crediting %.2f to account %s via UPI\n", amount, toAccountId)
-	toAccount.Balance = toAccount.Balance + amount
-
-	// Update accounts
-	if err := s.accountRepo.UpdateAccount(fromAccount); err != nil {
-		return err
-	}
-
-	if err := s.accountRepo.UpdateAccount(toAccount); err != nil {
-		return err
-	}
-
-	fmt.Println("[SERVICE] UPI Transfer completed successfully")
-	return nil
-}
-
-// Single Responsibility - focused validation
-func (s *UPITransferService) validateTransferInput(fromAccountId, toAccountId string, amount float64) error {
-	if amount <= 0 {
-		return models.NewInvalidAmountError(amount)
-	}
-
-	if fromAccountId == toAccountId {
-		return &models.TransferError{
-			Code:    "SAME_ACCOUNT_TRANSFER",
-			Message: "Cannot transfer to the same account",
-			Details: map[string]interface{}{"accountId": fromAccountId},
+	for i := 0; i < 2; i++ {
+		select {
+		case e := <-errChan:
+			if e != nil {
+				return e
+			}
+		case <-ctx.Done():
+			return models.NewTimeoutError()
 		}
 	}
 
-	if fromAccountId == "" || toAccountId == "" {
-		return &models.TransferError{
-			Code:    "EMPTY_ACCOUNT_ID",
-			Message: "Account IDs cannot be empty",
-			Details: map[string]interface{}{
-				"fromAccountId": fromAccountId,
-				"toAccountId":   toAccountId,
-			},
-		}
-	}
-
+	s.incrementSuccessCount()
 	return nil
 }
 
-// Single Responsibility - only handles balance inquiry
-func (s *UPITransferService) GetAccountBalance(accountId string) (float64, error) {
-	fmt.Printf("[SERVICE] Getting balance for account: %s\n", accountId)
+func (s *UPITransferService) atomicTransfer(from, to *models.Account, amt float64) bool {
+	var first, second *models.Account
+	if from.ID < to.ID {
+		first, second = from, to
+	} else {
+		first, second = to, from
+	}
+	first.Mutex.Lock()
+	second.Mutex.Lock()
+	defer func() {
+		second.Mutex.Unlock()
+		first.Mutex.Unlock()
+	}()
+	if from.Balance >= amt {
+		from.Balance -= amt
+		to.Balance += amt
+		return true
+	}
+	return false
+}
 
-	account, err := s.accountRepo.GetAccountById(accountId)
+func (s *UPITransferService) validateInput(from, to string, amt float64) error {
+	if amt <= 0 {
+		return models.NewInvalidAmountError(amt)
+	}
+	if from == to {
+		return &models.TransferError{Code: "SAME_ACCOUNT_TRANSFER", Message: "Cannot transfer to same account"}
+	}
+	return nil
+}
+
+func (s *UPITransferService) GetAccountBalance(ctx context.Context, accountId string) (float64, error) {
+	acc, err := s.accountRepo.GetAccountById(ctx, accountId)
 	if err != nil {
 		return 0, err
 	}
+	return acc.GetBalance(), nil
+}
 
-	return account.Balance, nil
+func (s *UPITransferService) BulkTransfer(ctx context.Context, transfers []models.TransferRequest) []models.TransferResult {
+	const workers = 3
+	jobChan := make(chan models.TransferRequest, len(transfers))
+	resChan := make(chan models.TransferResult, len(transfers))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for tr := range jobChan {
+				err := s.Transfer(ctx, tr.FromAccountId, tr.ToAccountId, tr.Amount)
+				resChan <- models.TransferResult{RequestId: tr.RequestId, Success: err == nil, Error: err}
+			}
+		}(i)
+	}
+
+	for _, t := range transfers {
+		jobChan <- t
+	}
+	close(jobChan)
+
+	go func() {
+		wg.Wait()
+		close(resChan)
+	}()
+
+	var results []models.TransferResult
+	for r := range resChan {
+		results = append(results, r)
+	}
+	return results
+}
+func (s *UPITransferService) incrementTransferCount() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.transferCount++
+}
+func (s *UPITransferService) incrementSuccessCount() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.successCount++
+}
+func (s *UPITransferService) GetStats() (int64, int64) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.transferCount, s.successCount
 }
